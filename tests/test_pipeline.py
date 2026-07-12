@@ -1,0 +1,107 @@
+"""
+Unit tests for SentinelRAG pipeline assembly.
+
+Tests cover:
+  - assemble_agentic_rag_workflow compiles without error.
+  - The compiled graph contains the expected node names (6 nodes now).
+
+All external dependencies are mocked so these tests run offline.
+"""
+
+import os
+import unittest
+from unittest.mock import patch, MagicMock
+
+os.environ.setdefault("XAI_API_KEY", "test-xai-key")
+os.environ.setdefault("OPENAI_API_KEY", "test-openai-key")
+
+from src.pipeline import assemble_agentic_rag_workflow
+
+
+class TestPipelineAssembly(unittest.TestCase):
+    """Tests for assemble_agentic_rag_workflow(vectorstore)."""
+
+    @patch("src.nodes.settings")
+    @patch("src.edges.settings")
+    @patch("src.pipeline.nodes")
+    def test_workflow_compiles_successfully(
+        self, mock_nodes_module, mock_edges_cfg, mock_nodes_cfg
+    ):
+        """Passing a mock vectorstore should produce a compiled graph without errors."""
+        for cfg in (mock_edges_cfg, mock_nodes_cfg):
+            cfg.max_loop_count = 3
+
+        # Mock all node functions so compilation doesn't require real imports
+        for name in (
+            "retrieve_node",
+            "grade_documents_node",
+            "rerank_documents_node",
+            "rewrite_query_node",
+            "generate_node",
+            "extract_citations_node",
+        ):
+            setattr(mock_nodes_module, name, MagicMock())
+
+        mock_vectorstore = MagicMock()
+        compiled = assemble_agentic_rag_workflow(mock_vectorstore)
+
+        self.assertIsNotNone(compiled, "Compiled workflow should not be None")
+
+    @patch("src.nodes.settings")
+    @patch("src.edges.settings")
+    @patch("src.pipeline.nodes")
+    def test_workflow_has_expected_nodes(
+        self, mock_nodes_module, mock_edges_cfg, mock_nodes_cfg
+    ):
+        """The compiled graph must include all six pipeline nodes."""
+        for cfg in (mock_edges_cfg, mock_nodes_cfg):
+            cfg.max_loop_count = 3
+
+        for name in (
+            "retrieve_node",
+            "grade_documents_node",
+            "rerank_documents_node",
+            "rewrite_query_node",
+            "generate_node",
+            "extract_citations_node",
+        ):
+            setattr(mock_nodes_module, name, MagicMock())
+
+        mock_vectorstore = MagicMock()
+        compiled = assemble_agentic_rag_workflow(mock_vectorstore)
+
+        expected_nodes = {
+            "retrieve",
+            "grade_documents",
+            "rerank_documents",
+            "rewrite_query",
+            "generate",
+            "extract_citations",
+        }
+
+        graph_nodes = set()
+        if hasattr(compiled, "nodes"):
+            graph_nodes = (
+                set(compiled.nodes.keys())
+                if isinstance(compiled.nodes, dict)
+                else set(compiled.nodes)
+            )
+        elif hasattr(compiled, "get_graph"):
+            graph = compiled.get_graph()
+            if hasattr(graph, "nodes"):
+                graph_nodes = (
+                    set(graph.nodes.keys())
+                    if isinstance(graph.nodes, dict)
+                    else set(graph.nodes)
+                )
+
+        user_nodes = {n for n in graph_nodes if not n.startswith("__")}
+
+        self.assertTrue(
+            expected_nodes.issubset(user_nodes),
+            f"Missing nodes: {expected_nodes - user_nodes}. Found: {user_nodes}",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
