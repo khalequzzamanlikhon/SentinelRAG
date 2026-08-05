@@ -17,6 +17,20 @@
 
 **SentinelRAG** goes beyond naive retrieve-and-generate. It implements a **self-correcting agentic loop** — documents are graded for relevance, queries are intelligently rewritten when context is insufficient, generated answers are audited for hallucinations, and the entire decision trail is exposed through a transparent audit interface.
 
+[Features](#-features) · [Architecture](#-architecture) · [Quick Start](#-quick-start) · [How It Works](#-how-it-works) · [Tech Stack](#-tech-stack) · [Evaluation](#-evaluation) · [License](#-license)
+
+<br>
+
+<div align="center">
+  <img src="demo.gif" alt="SentinelRAG Demo" width="700" />
+</div>
+
+</div>
+
+---
+
+## ✨ Features
+
 **What's new in v2.1:**
 - 🔀 **Hybrid dense+sparse retrieval** — combines Qdrant vector search with BM25 for better keyword recall
 - 🎯 **Real cross-encoder reranking** — BGE-reranker-v2-m3 replaces slow LLM-based reranking
@@ -27,78 +41,6 @@
 - 📈 **Self-play evaluation** — auto-generate test questions from your documents
 - ⏱️ **Rate limiting** — sliding-window protection for API usage
 - 🔍 **LangFuse tracing** — optional observability for production deployments
-
-[Features](#-features) · [Architecture](#-architecture) · [Quick Start](#-quick-start) · [How It Works](#-how-it-works) · [Tech Stack](#-tech-stack) · [Project Structure](#-project-structure) · [Evaluation](#-evaluation) · [License](#-license)
-
-</div>
-
----
-
-## ✨ Features
-
-<table>
-<tr>
-<td width="50%">
-
-### 🧠 Intelligent Hybrid Retrieval
-- Dense vector search via Qdrant with local BGE embeddings
-- BM25 sparse retrieval for keyword matching
-- Reciprocal rank fusion merging for optimal results
-- Configurable top-K with scored rankings
-
-</td>
-<td width="50%">
-
-### 🔄 Self-Correcting Pipeline
-- LLM-powered document relevance grading with structured Pydantic outputs
-- Multi-strategy automatic query rewriting (Semantic → Keyword → Hybrid → Expansion)
-- Real cross-encoder reranking (BGE-reranker-v2-m3)
-- Web search fallback via Tavily when local context is insufficient
-
-</td>
-</tr>
-<tr>
-<td width="50%">
-
-### 🔍 Hallucination Detection
-- Post-generation grounding audit against source documents
-- Quantified grounding scores (0.0 – 1.0) with detailed reasoning
-- Explicit identification of unsupported claims
-- Confidence calibration metrics
-
-</td>
-<td width="50%">
-
-### 🛡️ Production Guardrails
-- Prompt injection detection with blocked pattern matching
-- Unicode homoglyph detection against adversarial inputs
-- Maximum query length enforcement
-- Rate limiting with sliding window
-
-</td>
-</tr>
-<tr>
-<td width="50%">
-
-### 📊 Full Observability
-- Streamlit chat UI with expandable **Agent Audit Trail**
-- Per-query metrics: retrieval scores, grading rationale, strategy used
-- Source citation display with confidence scores
-- Optional LangFuse tracing for production monitoring
-- Real-time token-level streaming generation
-
-</td>
-<td width="50%">
-
-### 📈 RAGAS Evaluation
-- Faithfulness, context precision, context recall, answer relevancy scoring
-- Composite scoring with configurable weights
-- Self-play question generation from documents
-- JSON exportable evaluation reports
-
-</td>
-</tr>
-</table>
 
 ---
 
@@ -290,58 +232,6 @@ Structured source citations with confidence scores are extracted. The complete a
 | **PDF Parsing** | [PyMuPDF](https://pymupdf.readthedocs.io/) | High-performance PDF extraction |
 | **Tracing** | [LangFuse](https://langfuse.com/) | Optional production observability |
 | **CI/CD** | [GitHub Actions](https://github.com/features/actions) | Automated pytest |
-
----
-
-## 📁 Project Structure
-
-```
-SentinelRAG/
-├── src/                          # Core pipeline logic
-│   ├── config.py                 # Pydantic settings — Groq, Tavily, Qdrant, all params
-│   ├── state.py                  # AgentState TypedDict, structured output schemas
-│   ├── nodes.py                  # LangGraph nodes (8 nodes in v2.1)
-│   ├── edges.py                  # Conditional routing — grades, rerank, web, generation
-│   ├── pipeline.py               # StateGraph assembly + compilation
-│   ├── evaluators.py             # Retrieval, generation, RAGAS metrics
-│   ├── utils.py                  # Caching, cross-encoder, BM25, RRF merge, rate limiter
-│   ├── web_search.py             # Tavily web search integration (NEW)
-│   ├── guardrails.py             # Input validation + prompt injection detection (NEW)
-│   └── exceptions.py             # 13 typed exception classes
-│
-├── ui/
-│   └── streamlit_app.py          # Chat UI with streaming + audit trail
-│
-├── ingestion/
-│   └── load_documents.py         # PDF parsing, chunking, Qdrant + BM25 indexing
-│
-├── evaluation/
-│   ├── __init__.py
-│   └── ragas_eval.py             # RAGAS evaluation + self-play question gen (NEW)
-│
-├── tests/
-│   ├── test_nodes.py
-│   ├── test_edges.py
-│   ├── test_pipeline.py
-│   ├── test_utils.py
-│   └── test_evaluators.py
-│
-├── data/
-│   └── raw/                      # Place your PDFs here
-│
-├── docker/
-│   └── Dockerfile                # Container build instructions
-│
-├── docs/
-│   ├── USER_INSTRUCTIONS.md
-│   └── SETUP_GUIDE.md            # Comprehensive setup guide (NEW)
-│
-├── docker-compose.yml            # Multi-service Docker (Qdrant + App)
-├── requirements.txt              # Python dependencies
-├── pyproject.toml                # Package metadata + tool config
-├── pytest.ini                    # Test runner config
-└── .github/workflows/pytest.yml  # CI pipeline
-```
 
 ---
 
