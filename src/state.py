@@ -1,5 +1,12 @@
 """
 Pydantic schemas and TypedDict for the SentinelRAG agent state.
+
+NEW in v2.1:
+  - Web search results & metadata
+  - Streaming token accumulator
+  - Confidence calibration fields
+  - Guardrail pass/fail status
+  - BM25 sparse results
 """
 
 from typing import List, TypedDict, Optional, Dict, Any
@@ -17,13 +24,18 @@ class QueryStrategy(str, Enum):
     EXPANSION = "expansion"
 
 
+class SearchSource(str, Enum):
+    """Where the retrieved context came from."""
+    VECTOR = "vector"
+    BM25 = "bm25"
+    WEB = "web"
+    HYBRID = "hybrid"
+
+
 class AgentState(TypedDict):
     """Shared operational state that flows through the LangGraph pipeline.
 
-    Every node reads from and/or writes to this dict. New fields added:
-      - reranked_documents  — post-reranking candidates
-      - citations           — source-attributed citation list
-      - conversation_history — sliding window of previous Q&A turns
+    Every node reads from and/or writes to this dict.
     """
 
     # --- Query ---
@@ -32,8 +44,11 @@ class AgentState(TypedDict):
 
     # --- Retrieval ---
     documents: List[Document]         # Vector-store retrieval results
-    reranked_documents: List[Document]  # Post-reranking candidates (NEW)
+    reranked_documents: List[Document]  # Post-reranking candidates
+    bm25_documents: List[Document]     # BM25 sparse retrieval results (NEW)
+    web_documents: List[Document]      # Web search results (NEW)
     web_search: bool                  # True = insufficient context found
+    search_source: str                # Which source provided the context (NEW)
 
     # --- Grading & Rewriting ---
     query_strategy: QueryStrategy     # Current rewrite strategy
@@ -41,14 +56,17 @@ class AgentState(TypedDict):
 
     # --- Generation ---
     generation: Optional[str]         # Generated response text
-    citations: List[Dict[str, Any]]   # Source-attributed citations (NEW)
+    streaming_tokens: List[str]       # Accumulated streaming tokens (NEW)
+    citations: List[Dict[str, Any]]   # Source-attributed citations
 
     # --- Conversation ---
-    conversation_history: List[Dict[str, str]]  # Previous Q&A turns (NEW)
+    conversation_history: List[Dict[str, str]]  # Previous Q&A turns
 
     # --- Metrics & Audit ---
     retrieval_metrics: Dict[str, Any]
     generation_metrics: Dict[str, Any]
+    confidence_calibration: Dict[str, Any]  # Calibrated confidence scores (NEW)
+    guardrail_passed: bool            # Whether input passed content safety (NEW)
 
     # --- Error Handling ---
     error: Optional[str]
@@ -106,4 +124,29 @@ class Citation(BaseModel):
         description="Confidence that this claim is supported by the source (0.0 – 1.0).",
         ge=0.0,
         le=1.0,
+    )
+
+
+class CitationList(BaseModel):
+    """Wrapper model for extracting a list of citations via structured output.
+
+    LangChain's ``with_structured_output()`` cannot accept ``list[Citation]``
+    directly because ``inspect.signature()`` fails on generic type aliases.
+    This wrapper provides a concrete Pydantic model instead.
+    """
+
+    citations: List[Citation] = Field(
+        description="List of extracted source citations.",
+        default_factory=list,
+    )
+
+
+class GuardrailResult(BaseModel):
+    """Result of input guardrail validation."""
+
+    passed: bool = Field(description="Whether the input passed all guardrail checks.")
+    reason: str = Field(description="Explanation if the input was blocked.")
+    blocked_pattern: Optional[str] = Field(
+        default=None,
+        description="The specific pattern that triggered the block, if any."
     )

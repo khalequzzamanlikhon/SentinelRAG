@@ -4,21 +4,26 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "sentinelrag"
-version = "2.0.0"
-description = "Self-Correcting Agentic RAG System — retrieve, validate, correct, generate."
+version = "2.1.0"
+description = "Self-Correcting Agentic RAG System — retrieve, validate, correct, generate. Hybrid search, cross-encoder reranking, web fallback, guardrails, streaming."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
     {name = "SentinelRAG Team"},
 ]
-keywords = ["rag", "langgraph", "llm", "vector-search", "hallucination-detection", "xai", "grok"]
+keywords = [
+    "rag", "langgraph", "llm", "vector-search", "hallucination-detection",
+    "groq", "qdrant", "hybrid-search", "bm25", "cross-encoder", "guardrails",
+    "tavily", "ragas", "streaming",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
@@ -27,6 +32,7 @@ dependencies = [
     "langchain-openai>=0.1.0",
     "langchain-qdrant>=1.0.0",
     "langchain-community>=0.0.10",
+    "langchain-huggingface>=0.0.1",
     "qdrant-client>=1.7.0",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
@@ -36,21 +42,29 @@ dependencies = [
     "streamlit>=1.30.0",
     "PyMuPDF>=1.23.0",
     "pytest>=7.0.0",
+    "torch>=2.0.0",
+    "sentence-transformers>=2.2.2",
+    "tavily-python>=0.3.0",
 ]
+
+[project.optional-dependencies]
+tracing = ["langfuse>=2.0.0"]
+dev = ["pytest>=7.0.0", "pytest-cov>=4.0.0", "pytest-asyncio>=0.21.0"]
 
 [project.urls]
 Homepage = "https://github.com/your-username/SentinelRAG"
 Repository = "https://github.com/your-username/SentinelRAG"
 
 [tool.setuptools.packages.find]
-include = ["src*", "ui*", "ingestion*"]
+include = ["src*", "ui*", "ingestion*", "evaluation*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+asyncio_mode = "auto"
 
 [tool.coverage.run]
-source = ["src", "ingestion", "ui"]
+source = ["src", "ingestion", "ui", "evaluation"]
 omit = ["*/tests/*", "*/__pycache__/*"]
 
 [tool.coverage.report]

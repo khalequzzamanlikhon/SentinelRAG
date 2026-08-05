@@ -4,18 +4,18 @@ LangGraph nodes for the SentinelRAG agentic RAG pipeline.
 Each node is a callable that accepts ``state: AgentState`` (plus optional
 keyword dependencies) and returns a dict of state updates.
 
-Nodes:
-  - ``retrieve_node``          — vector similarity search
-  - ``grade_documents_node``   — LLM relevance grading
-  - ``rewrite_query_node``     — multi-strategy query rewriting
-  - ``generate_node``          — response synthesis
-  - ``detect_hallucinations``  — grounding audit
-  - ``rerank_documents_node``  — cross-encoder reranking (NEW)
-  - ``extract_citations_node`` — source attribution (NEW)
+Nodes (v2.1):
+  - ``retrieve_node``              — hybrid dense+BM25 retrieval
+  - ``grade_documents_node``       — LLM relevance grading
+  - ``rewrite_query_node``         — multi-strategy query rewriting
+  - ``rerank_documents_node``      — cross-encoder reranking (real model)
+  - ``web_search_node``            — Tavily web search fallback (NEW)
+  - ``generate_node``              — response synthesis with streaming
+  - ``extract_citations_node``     — source attribution
 """
 
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
@@ -27,6 +27,7 @@ from src.state import (
     GradeDocument,
     GradeHallucination,
     Citation,
+    CitationList,
     QueryStrategy,
 )
 from src.utils import (
@@ -34,8 +35,19 @@ from src.utils import (
     cache_llm_call,
     deterministic_hash,
     deduplicate_documents,
+    rerank_with_cross_encoder,
+    get_bm25_retriever,
+    merge_hybrid_results,
+    check_rate_limit,
 )
 from src.evaluators import compute_retrieval_metrics
+from src.exceptions import (
+    RetrievalError,
+    GradingError,
+    QueryRewriteError,
+    GenerationError,
+    RerankerError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,51 +74,85 @@ def _get_llm(temperature: float) -> ChatOpenAI:
 
 
 # ===================================================================
-# 1. Retrieval Node
+# 1. Retrieval Node (hybrid: dense + BM25)
 # ===================================================================
 
 
 def retrieve_node(state: AgentState, vectorstore) -> dict:
-    """Query the vector database with the current active query string.
+    """Query the vector database + BM25 with the current active query string.
 
-    Returns documents sorted by cosine similarity along with retrieval metrics.
+    When hybrid search is enabled, merges dense (Qdrant) and sparse (BM25)
+    results using reciprocal rank fusion. Returns sorted, deduplicated documents
+    with retrieval metrics.
+
+    Raises:
+        RetrievalError: If retrieval fails critically.
     """
-    logger.info("--- NODE: RETRIEVING DOCUMENTS ---")
+    logger.info("--- NODE: RETRIEVING DOCUMENTS (hybrid) ---")
     query = state["current_query"]
     metadata = state.get("metadata", {})
 
     try:
+        # Dense retrieval
         retrieved_docs = vectorstore.similarity_search(query, k=settings.top_k_documents)
 
         docs_with_scores: List[Document] = []
         for doc in retrieved_docs:
             score = compute_document_similarity(query, doc.page_content)
             doc.metadata["similarity_score"] = score
+            doc.metadata["search_source"] = "dense"
             docs_with_scores.append(doc)
 
         docs_with_scores.sort(
             key=lambda x: x.metadata.get("similarity_score", 0), reverse=True
         )
-
-        # Deduplicate
         docs_with_scores = deduplicate_documents(docs_with_scores)
 
-        retrieval_metrics = compute_retrieval_metrics(query, docs_with_scores)
+        # BM25 sparse retrieval (if enabled)
+        bm25_docs: List[Document] = []
+        if settings.enable_hybrid_search:
+            try:
+                bm25 = get_bm25_retriever()
+                bm25_docs = bm25.search(query, k=settings.top_k_documents)
+                logger.info("BM25 returned %d documents.", len(bm25_docs))
+            except Exception as e:
+                logger.warning("BM25 search failed (continuing with dense only): %s", e)
 
-        logger.info("Retrieved %d candidate documents.", len(docs_with_scores))
+        # Merge hybrid results
+        if bm25_docs:
+            final_docs = merge_hybrid_results(
+                dense_docs=docs_with_scores,
+                bm25_docs=bm25_docs,
+                dense_weight=settings.dense_weight,
+                bm25_weight=settings.bm25_weight,
+                top_k=settings.top_k_documents,
+            )
+        else:
+            final_docs = docs_with_scores
+
+        retrieval_metrics = compute_retrieval_metrics(query, final_docs)
+
+        logger.info(
+            "Retrieved %d documents (dense=%d, bm25=%d, merged=%d).",
+            len(final_docs),
+            len(docs_with_scores),
+            len(bm25_docs),
+            len(final_docs),
+        )
 
         return {
-            "documents": docs_with_scores,
+            "documents": final_docs,
+            "bm25_documents": bm25_docs,
             "retrieval_metrics": retrieval_metrics,
-            "metadata": {**metadata, "last_retrieval_count": len(docs_with_scores)},
+            "search_source": "hybrid" if bm25_docs else "dense",
+            "metadata": {**metadata, "last_retrieval_count": len(final_docs)},
         }
     except Exception as e:
         logger.exception("Error during retrieval")
-        return {
-            "documents": [],
-            "error": f"Retrieval failed: {e}",
-            "metadata": {**metadata, "retrieval_error": str(e)},
-        }
+        raise RetrievalError(
+            f"Retrieval failed: {e}",
+            details={"query": query, "error": str(e)},
+        )
 
 
 # ===================================================================
@@ -118,7 +164,10 @@ def grade_documents_node(state: AgentState) -> dict:
     """Evaluate retrieved documents for relevance to the current query.
 
     Drops irrelevant chunks and sets ``web_search`` to ``True`` when *all*
-    chunks are dropped to trigger a query rewrite.
+    chunks are dropped to trigger external search.
+
+    Raises:
+        GradingError: If grading fails for all documents.
     """
     logger.info("--- NODE: GRADING DOCUMENTS ---")
     query = state["current_query"]
@@ -126,8 +175,18 @@ def grade_documents_node(state: AgentState) -> dict:
     current_loops = state.get("loop_count", 0)
     metadata = state.get("metadata", {})
 
+    # Check rate limit
+    if not check_rate_limit():
+        logger.warning("Rate limit exceeded — proceeding with ungraded documents.")
+        return {
+            "documents": documents,
+            "web_search": False,
+            "loop_count": current_loops + 1,
+            "metadata": {**metadata, "rate_limited": True},
+        }
+
     llm = _get_llm(temperature=settings.temperature_deterministic)
-    structured_grader = llm.with_structured_output(GradeDocument, method='function_calling')
+    structured_grader = llm.with_structured_output(GradeDocument, method="function_calling")
 
     system_prompt = (
         "You are an objective auditor assessing if a retrieved document contains semantic information "
@@ -182,7 +241,7 @@ def grade_documents_node(state: AgentState) -> dict:
 
     trigger_rewrite = len(valid_documents) == 0
     if trigger_rewrite:
-        logger.info("All chunks dropped — marking for query rewrite.")
+        logger.info("All chunks dropped — triggering external search/rewrite.")
 
     return {
         "documents": valid_documents,
@@ -197,18 +256,61 @@ def grade_documents_node(state: AgentState) -> dict:
 
 
 # ===================================================================
-# 3. Reranking Node  (NEW)
+# 3. Web Search Node (NEW — Tavily fallback)
+# ===================================================================
+
+
+def web_search_node(state: AgentState) -> dict:
+    """Search the web via Tavily when local retrieval is insufficient.
+
+    Triggered when all documents are graded irrelevant AND max loops
+    haven't been reached yet.
+    """
+    logger.info("--- NODE: WEB SEARCH (Tavily) ---")
+    query = state["current_query"]
+    metadata = state.get("metadata", {})
+
+    if not settings.enable_web_search:
+        logger.info("Web search disabled — returning empty.")
+        return {"web_documents": [], "web_search": False}
+
+    try:
+        from src.web_search import search_web_safe
+        web_docs = search_web_safe(query)
+        logger.info("Web search returned %d documents.", len(web_docs))
+    except Exception as e:
+        logger.error("Web search failed: %s", e)
+        web_docs = []
+
+    return {
+        "web_documents": web_docs,
+        "documents": web_docs,  # use web results for generation
+        "web_search": False,    # reset flag
+        "search_source": "web",
+        "metadata": {
+            **metadata,
+            "web_search_attempted": True,
+            "web_search_used": True,
+            "web_result_count": len(web_docs),
+        },
+    }
+
+
+# ===================================================================
+# 4. Reranking Node (cross-encoder — real model)
 # ===================================================================
 
 
 def rerank_documents_node(state: AgentState) -> dict:
-    """Re-rank graded documents using cross-encoder style scoring.
+    """Re-rank graded documents using a cross-encoder model.
 
-    In a production system this would call a dedicated cross-encoder model.
-    Here we re-score with a focused LLM prompt that considers the full
-    query-document pair, then sort by the new score.
+    Uses ``BAAI/bge-reranker-v2-m3`` (or similar) for precise relevance
+    scoring. Falls back to cosine similarity if the model is unavailable.
+
+    Raises:
+        RerankerError: If reranking fails.
     """
-    logger.info("--- NODE: RERANKING DOCUMENTS ---")
+    logger.info("--- NODE: RERANKING DOCUMENTS (cross-encoder) ---")
     documents = state.get("documents", [])
     query = state["current_query"]
     metadata = state.get("metadata", {})
@@ -216,53 +318,28 @@ def rerank_documents_node(state: AgentState) -> dict:
     if not documents:
         return {"reranked_documents": []}
 
-    llm = _get_llm(temperature=settings.temperature_deterministic)
+    if not settings.enable_cross_encoder:
+        logger.info("Cross-encoder disabled — skipping rerank.")
+        return {"reranked_documents": documents}
 
-    system_prompt = (
-        "You are a precise relevance rater. Given a query and a document chunk, "
-        "output ONLY a single float score between 0.0 (completely irrelevant) "
-        "and 1.0 (perfectly relevant). Do NOT include any explanation or formatting."
-    )
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("human", "Query: {query}\n\nDocument:\n{doc_content}"),
-    ])
-    chain = prompt | llm
+    try:
+        reranked = rerank_with_cross_encoder(query, documents)
+        logger.info("Re-ranked %d documents with cross-encoder.", len(reranked))
 
-    scored: list = []
-    for doc in documents:
-        try:
-            cache_key = "rerank_{}_{}".format(query, deterministic_hash(doc.page_content[:200]))
-            response = cache_llm_call(
-                chain.invoke,
-                {"query": query, "doc_content": doc.page_content[:1500]},
-                cache_key=cache_key,
-            )
-            try:
-                rerank_score = float(response.content.strip())
-            except ValueError:
-                rerank_score = doc.metadata.get("grading", {}).get("relevance_score", 0.0)
-
-            doc.metadata["rerank_score"] = rerank_score
-            scored.append((rerank_score, doc))
-        except Exception as e:
-            logger.error("Error reranking document: %s", e)
-            doc.metadata["rerank_score"] = 0.0
-            scored.append((0.0, doc))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    reranked = [doc for _, doc in scored]
-
-    logger.info("Re-ranked %d documents.", len(reranked))
-
-    return {
-        "reranked_documents": reranked,
-        "metadata": {**metadata, "reranked": True},
-    }
+        return {
+            "reranked_documents": reranked,
+            "metadata": {**metadata, "reranked": True, "rerank_method": "cross_encoder"},
+        }
+    except Exception as e:
+        logger.error("Error reranking documents: %s", e)
+        raise RerankerError(
+            f"Reranking failed: {e}",
+            details={"query": query, "doc_count": len(documents)},
+        )
 
 
 # ===================================================================
-# 4. Query Rewriting Node
+# 5. Query Rewriting Node
 # ===================================================================
 
 
@@ -271,6 +348,9 @@ def rewrite_query_node(state: AgentState) -> dict:
 
     Cycles through SEMANTIC → KEYWORD → HYBRID → EXPANSION based on
     ``loop_count``.
+
+    Raises:
+        QueryRewriteError: If rewriting fails and fallback is needed.
     """
     logger.info("--- NODE: REWRITING USER QUERY ---")
     bad_query = state["current_query"]
@@ -341,7 +421,7 @@ def rewrite_query_node(state: AgentState) -> dict:
 
 
 # ===================================================================
-# 5. Generation Node
+# 6. Generation Node (with async streaming support)
 # ===================================================================
 
 
@@ -349,7 +429,11 @@ def generate_node(state: AgentState) -> dict:
     """Synthesise the final answer from validated context.
 
     Uses reranked documents if available, otherwise falls back to
-    graded documents.
+    graded documents. Supports token-level streaming via
+    ``generate_node_stream`` for async usage.
+
+    Raises:
+        GenerationError: If generation fails.
     """
     logger.info("--- NODE: GENERATING RESPONSE ---")
     question = state["question"]
@@ -370,7 +454,7 @@ def generate_node(state: AgentState) -> dict:
         "If the context does not provide data to answer, state clearly that the answer cannot be computed. "
         "Do not make up information not present in the context.\n\n"
         "When making claims, cite the source filename and provide the exact supporting excerpt "
-        "from the context. Format citations as: [Source: <filename>, Excerpt: \"...\"]"  # (prepares for citation extraction)
+        "from the context. Format citations as: [Source: <filename>, Excerpt: \"...\"]"
     )
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
@@ -396,6 +480,7 @@ def generate_node(state: AgentState) -> dict:
 
         return {
             "generation": generated_text,
+            "streaming_tokens": [],
             "current_query": question,
             "documents": documents,
             "generation_metrics": generation_metrics,
@@ -407,17 +492,93 @@ def generate_node(state: AgentState) -> dict:
         }
     except Exception as e:
         logger.exception("Error during generation")
-        return {
-            "generation": "I encountered an error while generating.",
-            "current_query": question,
-            "documents": documents,
-            "error": f"Generation failed: {e}",
-            "metadata": {**metadata, "generation_error": str(e)},
-        }
+        raise GenerationError(
+            f"Generation failed: {e}",
+            details={"question": question, "doc_count": len(documents)},
+        )
+
+
+async def generate_node_stream(state: AgentState) -> dict:
+    """Generate response with async LLM streaming, returning the complete result.
+
+    Uses the LLM's ``.astream()`` internally for non-blocking token collection.
+    All tokens are accumulated into ``streaming_tokens`` before returning.
+    The UI consumes partial tokens via the async workflow's ``.astream()``.
+
+    Args:
+        state: Current pipeline state.
+
+    Returns:
+        Dict with ``generation``, ``streaming_tokens``, and full metrics.
+
+    Raises:
+        GenerationError: If generation fails.
+    """
+    logger.info("--- NODE: GENERATING RESPONSE (async streaming) ---")
+    question = state["question"]
+    documents = state.get("reranked_documents") or state.get("documents", [])
+    metadata = state.get("metadata", {})
+
+    context = (
+        "\n\n".join([doc.page_content for doc in documents])
+        if documents
+        else "No valid context found."
+    )
+
+    llm = _get_llm(temperature=settings.temperature_deterministic)
+
+    system_prompt = (
+        "You are an enterprise technical support expert assistant. Synthesize a professional, "
+        "accurate, and fully complete response based strictly on the provided context block. "
+        "If the context does not provide data to answer, state clearly that the answer cannot be computed. "
+        "Do not make up information not present in the context.\n\n"
+        "When making claims, cite the source filename and provide the exact supporting excerpt "
+        "from the context. Format citations as: [Source: <filename>, Excerpt: \"...\"]"
+    )
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("human", "Context Materials:\n{context}\n\nUser Question: {question}"),
+    ])
+
+    generator_chain = prompt | llm
+    tokens: List[str] = []
+    full_text = ""
+
+    try:
+        async for chunk in generator_chain.astream(
+            {"context": context, "question": question}
+        ):
+            if hasattr(chunk, "content") and chunk.content:
+                token = chunk.content
+                tokens.append(token)
+                full_text += token
+    except Exception as e:
+        logger.exception("Error during async generation")
+        raise GenerationError(
+            f"Generation failed: {e}",
+            details={"question": question, "doc_count": len(documents)},
+        )
+
+    generation_metrics: Dict[str, Any] = {}
+    if documents:
+        generation_metrics = detect_hallucinations(full_text, documents)
+
+    return {
+        "generation": full_text,
+        "streaming_tokens": tokens,
+        "current_query": question,
+        "documents": documents,
+        "generation_metrics": generation_metrics,
+        "metadata": {
+            **metadata,
+            "generation_length": len(full_text),
+            "generation_token_count": len(tokens),
+        },
+    }
 
 
 # ===================================================================
-# 6. Hallucination Detection
+# 7. Hallucination Detection
 # ===================================================================
 
 
@@ -425,11 +586,12 @@ def detect_hallucinations(generation: str, documents: List[Document]) -> Dict[st
     """Audit the generated response for factual grounding against source documents.
 
     Returns detailed metrics including a list of specific unsupported claims.
+    Also computes confidence calibration metrics.
     """
     logger.info("--- DETECTING HALLUCINATIONS ---")
 
     llm = _get_llm(temperature=settings.temperature_deterministic)
-    structured_grader = llm.with_structured_output(GradeHallucination, method='function_calling')
+    structured_grader = llm.with_structured_output(GradeHallucination, method="function_calling")
 
     context = "\n\n".join([doc.page_content for doc in documents])
 
@@ -454,9 +616,12 @@ def detect_hallucinations(generation: str, documents: List[Document]) -> Dict[st
             cache_key=cache_key,
         )
 
-        logger.info("Hallucination check: %s (score: %.2f)", result.binary_score, result.grounded_score)
-        if result.hallucinated_claims:
-            logger.info("Identified %d hallucinated claims.", len(result.hallucinated_claims))
+        logger.info(
+            "Hallucination check: %s (score: %.2f, claims: %d)",
+            result.binary_score,
+            result.grounded_score,
+            len(result.hallucinated_claims),
+        )
 
         return {
             "grounded_score": result.grounded_score,
@@ -475,7 +640,7 @@ def detect_hallucinations(generation: str, documents: List[Document]) -> Dict[st
 
 
 # ===================================================================
-# 7. Citation Extraction Node  (NEW)
+# 8. Citation Extraction Node
 # ===================================================================
 
 
@@ -494,11 +659,12 @@ def extract_citations_node(state: AgentState) -> dict:
         return {"citations": []}
 
     llm = _get_llm(temperature=settings.temperature_deterministic)
-    structured_extractor = llm.with_structured_output(Citation, method='function_calling')
+    structured_extractor = llm.with_structured_output(CitationList, method="function_calling")
 
+    # Use up to 10 documents with 1000 chars each (was 5/500)
     context_preview = "\n\n".join([
-        f"[Doc: {doc.metadata.get('source', 'unknown')}]\n{doc.page_content[:500]}"
-        for doc in documents[:5]
+        f"[Doc: {doc.metadata.get('source', 'unknown')}]\n{doc.page_content[:1000]}"
+        for doc in documents[:10]
     ])
 
     system_prompt = (
@@ -533,11 +699,7 @@ def extract_citations_node(state: AgentState) -> dict:
             cache_key=cache_key,
         )
 
-        # structured_extractor returns a list of Citation objects
-        if isinstance(result, list):
-            citations = [c.model_dump() for c in result]
-        else:
-            citations = [result.model_dump()]
+        citations = [c.model_dump() for c in result.citations]
 
         logger.info("Extracted %d citations.", len(citations))
         return {"citations": citations}

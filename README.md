@@ -1,15 +1,15 @@
 <div align="center">
 
-# 🛡️ SentinelRAG
+# 🛡️ SentinelRAG v2.1
 
-### Self-Correcting Agentic RAG System
+### Self-Correcting Agentic RAG System with Hybrid Search
 
-*An intelligent retrieval-augmented generation pipeline that validates, corrects, and refines its own outputs through a multi-stage agent workflow.*
+*An intelligent retrieval-augmented generation pipeline that validates, corrects, and refines its own outputs through a multi-stage agent workflow — now with cross-encoder reranking, BM25 hybrid search, web fallback, input guardrails, and real-time streaming.*
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/LangGraph-Orchestration-1C3C3C?style=for-the-badge&logo=langchain&logoColor=white)](https://langchain-ai.github.io/langgraph/)
 [![Streamlit](https://img.shields.io/badge/Streamlit-UI-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)](https://streamlit.io/)
-[![Grok (xAI)](https://img.shields.io/badge/Grok-xAI-000000?style=for-the-badge&logo=x&logoColor=white)](https://x.ai/)
+[![Groq](https://img.shields.io/badge/Groq-LLM-F55036?style=for-the-badge&logo=groq&logoColor=white)](https://groq.com/)
 [![Qdrant](https://img.shields.io/badge/Qdrant-Vector_DB-DC244C?style=for-the-badge&logo=qdrant&logoColor=white)](https://qdrant.tech/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-22C55E?style=for-the-badge)](LICENSE)
 
@@ -17,7 +17,18 @@
 
 **SentinelRAG** goes beyond naive retrieve-and-generate. It implements a **self-correcting agentic loop** — documents are graded for relevance, queries are intelligently rewritten when context is insufficient, generated answers are audited for hallucinations, and the entire decision trail is exposed through a transparent audit interface.
 
-[Features](#-features) · [Architecture](#-architecture) · [Quick Start](#-quick-start) · [How It Works](#-how-it-works) · [Tech Stack](#-tech-stack) · [Project Structure](#-project-structure) · [License](#-license)
+**What's new in v2.1:**
+- 🔀 **Hybrid dense+sparse retrieval** — combines Qdrant vector search with BM25 for better keyword recall
+- 🎯 **Real cross-encoder reranking** — BGE-reranker-v2-m3 replaces slow LLM-based reranking
+- 🌐 **Web search fallback** — Tavily integration when local documents are insufficient
+- 🛡️ **Input guardrails** — prompt injection detection, length limits, homoglyph detection
+- ⚡ **Streaming generation** — token-by-token real-time display
+- 📊 **RAGAS evaluation** — faithfulness, context precision/recall, answer relevancy metrics
+- 📈 **Self-play evaluation** — auto-generate test questions from your documents
+- ⏱️ **Rate limiting** — sliding-window protection for API usage
+- 🔍 **LangFuse tracing** — optional observability for production deployments
+
+[Features](#-features) · [Architecture](#-architecture) · [Quick Start](#-quick-start) · [How It Works](#-how-it-works) · [Tech Stack](#-tech-stack) · [Project Structure](#-project-structure) · [Evaluation](#-evaluation) · [License](#-license)
 
 </div>
 
@@ -29,18 +40,20 @@
 <tr>
 <td width="50%">
 
-### 🧠 Intelligent Retrieval
-- Semantic similarity search over embedded PDF documents
-- Configurable top-k retrieval with scored rankings
-- Embedded Qdrant vector store — **zero Docker dependency** for local development
+### 🧠 Intelligent Hybrid Retrieval
+- Dense vector search via Qdrant with local BGE embeddings
+- BM25 sparse retrieval for keyword matching
+- Reciprocal rank fusion merging for optimal results
+- Configurable top-K with scored rankings
 
 </td>
 <td width="50%">
 
 ### 🔄 Self-Correcting Pipeline
 - LLM-powered document relevance grading with structured Pydantic outputs
-- Automatic query rewriting when retrieved context is insufficient
-- Configurable loop limits to prevent infinite correction cycles
+- Multi-strategy automatic query rewriting (Semantic → Keyword → Hybrid → Expansion)
+- Real cross-encoder reranking (BGE-reranker-v2-m3)
+- Web search fallback via Tavily when local context is insufficient
 
 </td>
 </tr>
@@ -50,16 +63,17 @@
 ### 🔍 Hallucination Detection
 - Post-generation grounding audit against source documents
 - Quantified grounding scores (0.0 – 1.0) with detailed reasoning
-- Explicit identification of unsupported claims in generated responses
+- Explicit identification of unsupported claims
+- Confidence calibration metrics
 
 </td>
 <td width="50%">
 
-### 🎯 Multi-Strategy Query Rewriting
-- **Semantic** — rewrites to maximize meaning overlap with documents
-- **Keyword** — extracts and reorders critical terms by importance
-- **Hybrid** — combines keyword precision with semantic breadth
-- **Expansion** — enriches queries with synonyms and related concepts
+### 🛡️ Production Guardrails
+- Prompt injection detection with blocked pattern matching
+- Unicode homoglyph detection against adversarial inputs
+- Maximum query length enforcement
+- Rate limiting with sliding window
 
 </td>
 </tr>
@@ -69,17 +83,18 @@
 ### 📊 Full Observability
 - Streamlit chat UI with expandable **Agent Audit Trail**
 - Per-query metrics: retrieval scores, grading rationale, strategy used
-- Complete execution time tracking per interaction
-- **NEW:** Source citation display with confidence scores
-- **NEW:** User feedback (thumbs up/down) on responses
+- Source citation display with confidence scores
+- Optional LangFuse tracing for production monitoring
+- Real-time token-level streaming generation
 
 </td>
 <td width="50%">
 
-### 📄 PDF Ingestion Pipeline
-- Automated PDF parsing with PyMuPDF (fitz)
-- Intelligent document chunking for optimal retrieval
-- Idempotent ingestion — skips already-processed documents automatically
+### 📈 RAGAS Evaluation
+- Faithfulness, context precision, context recall, answer relevancy scoring
+- Composite scoring with configurable weights
+- Self-play question generation from documents
+- JSON exportable evaluation reports
 
 </td>
 </tr>
@@ -93,36 +108,44 @@ The core of SentinelRAG is a **stateful LangGraph workflow** where each node per
 
 ```mermaid
 graph TD
-    A["📥 User Query"] --> B["🔎 Retrieve"]
+    A["📥 User Query"] --> G["🛡️ Guardrails"]
+    G -->|"Passed"| B["🔎 Hybrid Retrieve<br/>(Dense + BM25)"]
+    G -->|"Blocked"| X["❌ Reject"]
     B --> C["📋 Grade Documents"]
-    C -->|"All chunks relevant"| D["📊 Rerank Context"]
-    C -->|"Insufficient context"| E["🔄 Rewrite Query"]
-    E -->|"Strategy: Semantic / Keyword / Hybrid / Expansion"| B
-    D --> F["⚡ Generate"]
-    F --> G["🛡️ Hallucination Check"]
-    G --> H["📚 Extract Citations"]
-    H --> I["✅ Finalize Response"]
+    C -->|"Relevant docs found"| D["🎯 Cross-Encoder Rerank"]
+    C -->|"All irrelevant"| E["🌐 Web Search (Tavily)"]
+    C -->|"All irrelevant + no web"| F["🔄 Rewrite Query"]
+    E --> C
+    F --> B
+    D --> H["⚡ Generate (Streaming)"]
+    H --> I["🛡️ Hallucination Check"]
+    I --> J["📚 Extract Citations"]
+    J --> K["✅ Finalize Response"]
 
     style A fill:#6366f1,stroke:#4f46e5,color:#fff
     style B fill:#3b82f6,stroke:#2563eb,color:#fff
     style C fill:#f59e0b,stroke:#d97706,color:#fff
     style D fill:#8b5cf6,stroke:#7c3aed,color:#fff
-    style E fill:#ef4444,stroke:#dc2626,color:#fff
-    style F fill:#8b5cf6,stroke:#7c3aed,color:#fff
-    style G fill:#ec4899,stroke:#db2777,color:#fff
-    style H fill:#14b8a6,stroke:#0d9488,color:#fff
-    style I fill:#22c55e,stroke:#16a34a,color:#fff
+    style E fill:#14b8a6,stroke:#0d9488,color:#fff
+    style F fill:#ef4444,stroke:#dc2626,color:#fff
+    style H fill:#8b5cf6,stroke:#7c3aed,color:#fff
+    style I fill:#ec4899,stroke:#db2777,color:#fff
+    style J fill:#14b8a6,stroke:#0d9488,color:#fff
+    style K fill:#22c55e,stroke:#16a34a,color:#fff
 ```
 
 ### Decision Logic
 
 | Checkpoint | Condition | Route |
 |---|---|---|
-| **Post-Grading** | All documents graded irrelevant | → Rewrite Query (rotate strategy) |
-| **Post-Grading** | Relevant documents found | → Rerank Context |
-| **Post-Grading** | Max loop count reached | → Rerank Context (force with best available context) |
-| **Post-Reranking** | Reranking complete | → Generate Response |
-| **Post-Generation** | Grounding audit + citations extracted | → Finalize Response |
+| **Guardrails** | Input passes all safety checks | → Retrieve |
+| **Guardrails** | Blocked pattern / too long / homoglyphs | → Reject |
+| **Post-Grading** | Relevant documents found | → Rerank (cross-encoder) |
+| **Post-Grading** | All docs irrelevant + web enabled | → Web Search (Tavily) |
+| **Post-Grading** | All docs irrelevant + web disabled | → Rewrite Query |
+| **Post-Grading** | Max loop count reached | → Rerank (best available) |
+| **Post-Reranking** | Cross-encoder scoring complete | → Generate |
+| **Post-Generation** | Hallucination audit + citations | → Finalize |
 
 ---
 
@@ -131,8 +154,8 @@ graph TD
 ### Prerequisites
 
 - **Python 3.10+**
-- **xAI API key** — for Grok LLM inference ([get one here](https://console.x.ai/))
-- **OpenAI API key** — for text-embedding-3-small embeddings ([get one here](https://platform.openai.com/api-keys))
+- **Groq API key** — for LLM inference ([get free key](https://console.groq.com))
+- *(Optional)* **Tavily API key** — for web search fallback ([get free key](https://tavily.com))
 
 ### 1. Clone the Repository
 
@@ -143,16 +166,10 @@ cd SentinelRAG
 
 ### 2. Create a Virtual Environment
 
-**Windows:**
-```powershell
-python -m venv .venv
-.venv\Scripts\activate
-```
-
-**macOS / Linux:**
 ```bash
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate  # macOS/Linux
+# or: .venv\Scripts\activate  (Windows)
 ```
 
 ### 3. Install Dependencies
@@ -163,19 +180,27 @@ pip install -r requirements.txt
 
 ### 4. Configure Environment Variables
 
-Create a `.env` file in the project root with your API keys:
+Create a `.env` file in the project root:
 
 ```env
-# LLM — xAI Grok
-XAI_API_KEY=your_xai_api_key_here
+# Required — LLM (Groq, free tier: 14,400 req/day)
+GROQ_API_KEY=gsk_your_groq_key_here
 
-# Embeddings — OpenAI
-OPENAI_API_KEY=your_openai_api_key_here
+# Optional — Web search fallback
+TAVILY_API_KEY=tvly_your_tavily_key_here
+
+# Optional — Fallback LLM
+GEMINI_API_KEY=your_gemini_key_here
+
+# Optional — Observability
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+ENABLE_TRACING=false
 ```
 
 ### 5. Add Your Documents
 
-Place one or more PDF files into the `data/raw/` directory:
+Place PDF files into `data/raw/`:
 
 ```
 data/
@@ -185,79 +210,65 @@ data/
     └── ...
 ```
 
-The ingestion pipeline runs automatically on first launch. It parses PDFs, chunks the text, generates embeddings via OpenAI, and stores vectors locally in Qdrant's embedded mode.
+On first launch, the pipeline automatically:
+1. Parses PDFs with PyMuPDF
+2. Chunks text intelligently
+3. Generates local embeddings (BAAI/bge-large-en-v1.5)
+4. Stores vectors in embedded Qdrant
+5. Builds BM25 sparse index for hybrid search
 
-### 6. Launch the Application
+### 6. Launch
 
 ```bash
 streamlit run ui/streamlit_app.py
 ```
 
-The Streamlit UI will open at `http://localhost:8501`. Ask questions about your documents and explore the agent audit trail for full transparency into the pipeline's decision-making.
+Open `http://localhost:8501` and start asking questions!
 
----
-
-### 🐳 Docker (Optional)
-
-For containerized deployment with a standalone Qdrant instance:
+### 🐳 Docker
 
 ```bash
 docker-compose up --build
 ```
 
-This starts two services:
+This starts:
 - **Qdrant** — vector database on port `6333`
 - **SentinelRAG App** — Streamlit UI on port `8501`
-
-> **Note:** When running via Docker, the app automatically connects to the Qdrant container service instead of using embedded mode.
 
 ---
 
 ## 🔬 How It Works
 
-SentinelRAG implements a **self-correcting agentic loop** using LangGraph's `StateGraph`. Each query flows through a structured pipeline where every stage evaluates its own output before proceeding.
+### Stage 1 — Guardrails (NEW)
+User input is validated against blocked patterns (prompt injection attempts), length limits, and Unicode homoglyph detection before entering the pipeline.
 
-### Stage 1 — Retrieve
+### Stage 2 — Hybrid Retrieve (NEW)
+The query is run against both:
+- **Dense** — Qdrant vector similarity (local BGE embeddings)
+- **Sparse** — BM25 keyword matching
 
-The user's query (or a rewritten variant) is used to perform a **similarity search** against the Qdrant vector store. The top-k most similar document chunks are retrieved and scored using cosine similarity.
+Results are merged via reciprocal rank fusion with configurable weights (default 70% dense, 30% BM25).
 
-### Stage 2 — Grade Documents
+### Stage 3 — Grade Documents
+Each chunk is evaluated by Groq (Llama 3.3 70B) acting as a relevance auditor. Chunks below the similarity threshold are dropped.
 
-Each retrieved chunk is evaluated by an LLM acting as an **objective relevance auditor**. The grader produces a structured Pydantic output containing:
-- A `relevance_score` (0.0 – 1.0)
-- A binary `yes/no` grade
-- A one-sentence `reasoning` justification
+### Stage 4a — Rewrite Query
+If all chunks are irrelevant, the query is rewritten using a rotating strategy (Semantic → Keyword → Hybrid → Expansion) and re-retrieved.
 
-Chunks below the configured similarity threshold are dropped. If **all chunks are dropped**, the pipeline triggers a query rewrite.
+### Stage 4b — Web Search (NEW)
+When all chunks are irrelevant and Tavily is configured, the pipeline searches the web for relevant context and grades those results too.
 
-### Stage 3 — Rewrite Query (Conditional)
+### Stage 5 — Cross-Encoder Rerank (NEW)
+Remaining documents are re-scored with `BAAI/bge-reranker-v2-m3` — a proper cross-encoder that's faster, cheaper, and more accurate than LLM-based reranking.
 
-When the grading stage determines that retrieved context is insufficient, the query enters a **rewriting loop**. SentinelRAG rotates through four strategies across successive iterations:
+### Stage 6 — Generate (Streaming)
+Groq synthesizes a grounded response. The UI receives tokens in real-time for a streaming chat experience.
 
-1. **Semantic** — restructures the query to maximize meaning overlap
-2. **Keyword** — distills the query to its most critical terms
-3. **Hybrid** — blends keyword precision with semantic context
-4. **Expansion** — enriches the query with synonyms and broader concepts
+### Stage 7 — Hallucination Detection
+A separate LLM pass audits every claim against source documents, producing a grounding score and a list of all unsupported claims.
 
-After rewriting, the pipeline loops back to the retrieval stage. A configurable `max_loop_count` prevents infinite cycles.
-
-### Stage 4 — Generate
-
-With validated context in hand, an LLM (Grok via xAI) synthesizes a grounded response. The generation prompt explicitly instructs the model to:
-- Base the answer **strictly on provided context**
-- Clearly state when context is insufficient
-- Never fabricate information
-
-### Stage 5 — Hallucination Detection
-
-The generated response undergoes a **grounding audit** where a separate LLM evaluation checks every claim against the source documents. This produces:
-- A `grounded_score` (0.0 – 1.0)
-- A list of specific `hallucinated_claims` identified in the output
-- Detailed `reasoning` explaining the assessment
-
-### Stage 6 — Finalize
-
-The validated response is returned to the user along with a complete **audit trail** including retrieval metrics, grading decisions, rewrite history, strategy used, and execution time.
+### Stage 8 — Citations + Finalize
+Structured source citations with confidence scores are extracted. The complete audit trail is assembled for display.
 
 ---
 
@@ -266,14 +277,19 @@ The validated response is returned to the user along with a complete **audit tra
 | Layer | Technology | Purpose |
 |---|---|---|
 | **Orchestration** | [LangGraph](https://langchain-ai.github.io/langgraph/) | Stateful agent workflow with conditional routing |
-| **LLM Inference** | [Grok (xAI)](https://x.ai/) | Response generation, document grading, hallucination detection |
-| **Embeddings** | [OpenAI](https://platform.openai.com/) | `text-embedding-3-small` for high-quality vector representations |
-| **Vector Store** | [Qdrant](https://qdrant.tech/) | Embedded (local) mode for development, containerized for production |
-| **Framework** | [LangChain](https://www.langchain.com/) | Prompt templates, structured outputs, LLM abstractions |
-| **Validation** | [Pydantic](https://docs.pydantic.dev/) | Typed settings, structured grading/hallucination schemas |
-| **UI** | [Streamlit](https://streamlit.io/) | Chat interface with audit trail visualization |
-| **PDF Parsing** | [PyMuPDF](https://pymupdf.readthedocs.io/) | High-performance PDF text extraction |
-| **CI/CD** | [GitHub Actions](https://github.com/features/actions) | Automated test execution via pytest |
+| **LLM Inference** | [Groq](https://groq.com/) + Llama 3.3 70B | Generation, grading, hallucination detection |
+| **LLM Fallback** | [Gemini 2.5 Flash](https://deepmind.google/) | Optional secondary LLM |
+| **Embeddings** | [BAAI/bge-large-en-v1.5](https://huggingface.co/BAAI/bge-large-en-v1.5) | Local dense embeddings (free, no API key) |
+| **Reranker** | [BGE-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3) | Cross-encoder relevance scoring |
+| **Hybrid Search** | BM25 (custom) + Qdrant | Sparse + dense reciprocal rank fusion |
+| **Vector Store** | [Qdrant](https://qdrant.tech/) | Embedded (local) or server mode |
+| **Web Search** | [Tavily](https://tavily.com/) | Real-time web fallback |
+| **Framework** | [LangChain](https://www.langchain.com/) | Prompt templates, structured outputs |
+| **Validation** | [Pydantic](https://docs.pydantic.dev/) | Typed settings, structured schemas |
+| **UI** | [Streamlit](https://streamlit.io/) | Chat interface with streaming |
+| **PDF Parsing** | [PyMuPDF](https://pymupdf.readthedocs.io/) | High-performance PDF extraction |
+| **Tracing** | [LangFuse](https://langfuse.com/) | Optional production observability |
+| **CI/CD** | [GitHub Actions](https://github.com/features/actions) | Automated pytest |
 
 ---
 
@@ -281,45 +297,103 @@ The validated response is returned to the user along with a complete **audit tra
 
 ```
 SentinelRAG/
-│
 ├── src/                          # Core pipeline logic
-│   ├── config.py                 # Pydantic settings — API keys, model params, thresholds
-│   ├── state.py                  # AgentState TypedDict, GradeDocument, GradeHallucination schemas
-│   ├── nodes.py                  # LangGraph nodes — retrieve, grade, rewrite, generate, detect
-│   ├── edges.py                  # Conditional routing — post-grading and post-generation logic
-│   ├── pipeline.py               # LangGraph StateGraph assembly and compilation
-│   ├── evaluators.py             # Retrieval and generation quality metrics
-│   ├── utils.py                  # Caching, similarity computation, document chunking
-│   └── exceptions.py             # Custom exception hierarchy
+│   ├── config.py                 # Pydantic settings — Groq, Tavily, Qdrant, all params
+│   ├── state.py                  # AgentState TypedDict, structured output schemas
+│   ├── nodes.py                  # LangGraph nodes (8 nodes in v2.1)
+│   ├── edges.py                  # Conditional routing — grades, rerank, web, generation
+│   ├── pipeline.py               # StateGraph assembly + compilation
+│   ├── evaluators.py             # Retrieval, generation, RAGAS metrics
+│   ├── utils.py                  # Caching, cross-encoder, BM25, RRF merge, rate limiter
+│   ├── web_search.py             # Tavily web search integration (NEW)
+│   ├── guardrails.py             # Input validation + prompt injection detection (NEW)
+│   └── exceptions.py             # 13 typed exception classes
 │
 ├── ui/
-│   └── streamlit_app.py          # Streamlit chat interface with audit trail
+│   └── streamlit_app.py          # Chat UI with streaming + audit trail
 │
 ├── ingestion/
-│   └── load_documents.py         # PDF ingestion, chunking, and Qdrant storage
+│   └── load_documents.py         # PDF parsing, chunking, Qdrant + BM25 indexing
+│
+├── evaluation/
+│   ├── __init__.py
+│   └── ragas_eval.py             # RAGAS evaluation + self-play question gen (NEW)
 │
 ├── tests/
-│   ├── test_nodes.py             # Unit tests for pipeline nodes
-│   ├── test_edges.py             # Unit tests for routing logic
-│   ├── test_pipeline.py          # Integration tests for the full workflow
-│   ├── test_utils.py             # Tests for utilities (caching, chunking, retry)
-│   └── test_evaluators.py        # Tests for retrieval and generation metrics
+│   ├── test_nodes.py
+│   ├── test_edges.py
+│   ├── test_pipeline.py
+│   ├── test_utils.py
+│   └── test_evaluators.py
 │
 ├── data/
-│   └── raw/                      # Place your PDF documents here
+│   └── raw/                      # Place your PDFs here
 │
 ├── docker/
 │   └── Dockerfile                # Container build instructions
 │
-├── .github/workflows/
-│   └── pytest.yml                # CI pipeline configuration
+├── docs/
+│   ├── USER_INSTRUCTIONS.md
+│   └── SETUP_GUIDE.md            # Comprehensive setup guide (NEW)
 │
-├── docker-compose.yml            # Multi-service Docker orchestration
+├── docker-compose.yml            # Multi-service Docker (Qdrant + App)
 ├── requirements.txt              # Python dependencies
-├── pytest.ini                    # Test runner configuration
-├── .env                          # Environment variables (not committed)
-└── .gitignore                    # Git exclusion rules
+├── pyproject.toml                # Package metadata + tool config
+├── pytest.ini                    # Test runner config
+└── .github/workflows/pytest.yml  # CI pipeline
 ```
+
+---
+
+## 📈 Evaluation
+
+Run the RAGAS evaluation suite to benchmark your pipeline:
+
+```python
+from evaluation.ragas_eval import RAGASEvaluator
+
+evaluator = RAGASEvaluator()
+evaluator.add_sample(
+    question="What is the leave policy?",
+    generated_answer="...",
+    context_docs=["..."],
+    hallucinated_claims=[],
+)
+report = evaluator.evaluate()
+print(f"Composite RAGAS Score: {report.composite_score:.2f}")
+evaluator.save_report("eval_report.json")
+```
+
+Generate self-play test questions from your documents:
+
+```python
+from evaluation.ragas_eval import generate_self_play_questions
+
+questions = generate_self_play_questions(documents, num_questions=20)
+```
+
+---
+
+## ⚙️ Configuration
+
+All parameters managed via `src/config.py`, overridable via environment variables:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `GROQ_API_KEY` | — | **Required** — Groq API key |
+| `TAVILY_API_KEY` | — | Optional — Tavily web search key |
+| `MAX_LOOP_COUNT` | `3` | Max query rewrite iterations |
+| `TOP_K_DOCUMENTS` | `5` | Chunks retrieved per query |
+| `SIMILARITY_THRESHOLD` | `0.7` | Min relevance score to keep |
+| `ENABLE_HYBRID_SEARCH` | `true` | BM25 + dense fusion |
+| `ENABLE_WEB_SEARCH` | `true` | Tavily fallback |
+| `ENABLE_CROSS_ENCODER` | `true` | Real cross-encoder reranking |
+| `ENABLE_GUARDRAILS` | `true` | Input validation |
+| `ENABLE_TRACING` | `false` | LangFuse observability |
+| `BM25_WEIGHT` | `0.3` | BM25 weight in hybrid fusion |
+| `DENSE_WEIGHT` | `0.7` | Dense weight in hybrid fusion |
+| `RATE_LIMIT_REQUESTS` | `30` | Max requests per window |
+| `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate limit window |
 
 ---
 
@@ -329,55 +403,11 @@ SentinelRAG/
 pytest
 ```
 
-Tests cover individual node behavior, conditional edge routing logic, and end-to-end pipeline execution.
-
----
-
-## ⚙️ Configuration
-
-All operational parameters are managed through Pydantic `Settings` in `src/config.py` and can be overridden via environment variables:
-
-| Parameter | Default | Description |
-|---|---|---|
-| `LLM_MODEL` | `grok-3-beta` | xAI model used for generation and grading |
-| `EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI model for embeddings |
-| `MAX_LOOP_COUNT` | `3` | Maximum query rewrite iterations |
-| `TOP_K_DOCUMENTS` | `5` | Number of chunks retrieved per query |
-| `SIMILARITY_THRESHOLD` | `0.7` | Minimum relevance score to keep a document |
-| `TEMPERATURE_DETERMINISTIC` | `0.0` | LLM temperature for grading / hallucination checks |
-| `TEMPERATURE_CREATIVE` | `0.3` | LLM temperature for query rewriting |
-| `ENABLE_CACHING` | `true` | Cache LLM calls to reduce cost and latency |
-| `CACHE_TTL_SECONDS` | `3600` | Cache time-to-live in seconds |
-
 ---
 
 ## 📜 License
 
-This project is licensed under the **MIT License**.
-
-```
-MIT License
-
-Copyright (c) 2025 SentinelRAG
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
+MIT License — see [LICENSE](LICENSE).
 
 ---
 
@@ -385,6 +415,6 @@ SOFTWARE.
 
 **Built with conviction that AI systems should explain their reasoning, not just deliver answers.**
 
-<sub>SentinelRAG — Retrieve. Validate. Correct. Generate.</sub>
+<sub>SentinelRAG v2.1 — Retrieve. Validate. Correct. Generate.</sub>
 
 </div>

@@ -1,6 +1,12 @@
 # Environment variables
 .env
 
+# Freebuff desktop app local data
+.freebuff/
+
+# Scratch extraction artifacts
+pdf_extract.txt
+
 # Python
 __pycache__/
 *.py[cod]

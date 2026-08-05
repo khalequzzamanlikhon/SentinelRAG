@@ -4,17 +4,21 @@ Utility functions for the SentinelRAG pipeline.
 Provides:
 - Deterministic hashing for cache keys
 - LRU cache with TTL for LLM calls
-- Singleton SentenceTransformer client (local embeddings, no API key)
+- Singleton SentenceTransformer client (local embeddings)
+- Cross-encoder reranker (NEW — BGE-reranker-v2-m3)
+- BM25 sparse retrieval engine (NEW)
 - Retry decorator for API resilience
 - Document chunking and similarity computation
+- Rate limiter for API protection (NEW)
 """
 
 import hashlib
 import time
 import logging
 import functools
+import threading
 from typing import Any, Callable, Dict, Optional, List
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from threading import Lock
 
 import numpy as np
@@ -79,6 +83,301 @@ def get_embeddings_client():
 
 
 # ---------------------------------------------------------------------------
+# Cross-encoder reranker (NEW — replaces LLM-based reranking)
+# ---------------------------------------------------------------------------
+
+_reranker_model = None
+_reranker_lock = Lock()
+
+
+def get_reranker():
+    """Return a shared singleton cross-encoder reranker.
+
+    Uses ``BAAI/bge-reranker-v2-m3`` by default — a multilingual,
+    lightweight cross-encoder that produces accurate relevance scores.
+    Downloaded once on first use and cached locally.
+
+    Returns:
+        A callable ``CrossEncoder`` that accepts (query, document) pairs
+        and returns relevance scores in [0, 1].
+    """
+    global _reranker_model
+    if _reranker_model is not None:
+        return _reranker_model
+    with _reranker_lock:
+        if _reranker_model is None:
+            try:
+                from sentence_transformers import CrossEncoder
+                logger.info(
+                    "Loading cross-encoder reranker '%s' ...",
+                    settings.reranker_model,
+                )
+                _reranker_model = CrossEncoder(settings.reranker_model)
+                logger.info("Cross-encoder loaded successfully.")
+            except ImportError:
+                logger.warning(
+                    "sentence-transformers CrossEncoder not available. "
+                    "Install with: pip install sentence-transformers. "
+                    "Falling back to similarity-based reranking."
+                )
+                _reranker_model = None
+        return _reranker_model
+
+
+def rerank_with_cross_encoder(
+    query: str,
+    documents: List[Document],
+    top_k: Optional[int] = None,
+) -> List[Document]:
+    """Rerank documents using a cross-encoder for precise relevance scoring.
+
+    Falls back to cosine similarity if the cross-encoder is unavailable.
+
+    Args:
+        query: The search query.
+        documents: Candidate documents to rerank.
+        top_k: Number of top documents to return (defaults to settings.reranker_top_k).
+
+    Returns:
+        Documents sorted by cross-encoder score (descending), each with
+        ``rerank_score`` in metadata.
+    """
+    if not documents:
+        return []
+
+    top_k = top_k or settings.reranker_top_k
+    reranker = get_reranker()
+
+    if reranker is not None:
+        # Use cross-encoder
+        pairs = [(query, doc.page_content[:2000]) for doc in documents]
+        scores = reranker.predict(pairs)
+
+        for doc, score in zip(documents, scores):
+            doc.metadata["rerank_score"] = float(score)
+            doc.metadata["rerank_method"] = "cross_encoder"
+
+        scored = sorted(zip(scores, documents), key=lambda x: x[0], reverse=True)
+        return [doc for _, doc in scored][:top_k]
+    else:
+        # Fallback: cosine similarity
+        logger.info("Cross-encoder unavailable — using cosine similarity for reranking.")
+        return _rerank_with_similarity(query, documents, top_k)
+
+
+def _rerank_with_similarity(
+    query: str,
+    documents: List[Document],
+    top_k: int,
+) -> List[Document]:
+    """Fallback reranker using embedding cosine similarity."""
+    client = get_embeddings_client()
+    query_emb = np.array(client.embed_query(query)).reshape(1, -1)
+
+    scored: list = []
+    for doc in documents:
+        try:
+            doc_emb = np.array(client.embed_query(doc.page_content[:1000])).reshape(1, -1)
+            score = float(cosine_similarity(query_emb, doc_emb)[0][0])
+        except Exception:
+            score = doc.metadata.get("grading", {}).get("relevance_score", 0.0)
+
+        doc.metadata["rerank_score"] = score
+        doc.metadata["rerank_method"] = "cosine_similarity"
+        scored.append((score, doc))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [doc for _, doc in scored][:top_k]
+
+
+# ---------------------------------------------------------------------------
+# BM25 Sparse Retrieval Engine (NEW)
+# ---------------------------------------------------------------------------
+
+class BM25Retriever:
+    """BM25 sparse retrieval engine for hybrid search.
+
+    Indexes a corpus of documents and retrieves the top-k matches for a
+    query using the Okapi BM25 algorithm. Designed to complement dense
+    vector search for improved keyword-matching recall.
+
+    Usage::
+
+        bm25 = BM25Retriever()
+        bm25.index(corpus_documents)
+        results = bm25.search("query text", k=5)
+    """
+
+    def __init__(self, k1: float = 1.5, b: float = 0.75):
+        self.k1 = k1
+        self.b = b
+        self._corpus: List[Document] = []
+        self._doc_freqs: Dict[str, int] = {}
+        self._doc_lengths: List[int] = []
+        self._avgdl: float = 0.0
+        self._idf_cache: Dict[str, float] = {}
+        self._indexed: bool = False
+        self._lock = Lock()
+
+    def _tokenize(self, text: str) -> List[str]:
+        """Basic whitespace tokenizer with lowercasing."""
+        return text.lower().split()
+
+    def index(self, documents: List[Document]) -> None:
+        """Build the BM25 index from a corpus of documents.
+
+        Args:
+            documents: List of LangChain Documents to index.
+        """
+        with self._lock:
+            self._corpus = documents
+            self._doc_lengths = []
+            self._doc_freqs = defaultdict(int)
+            self._idf_cache = {}
+
+            for doc in documents:
+                tokens = self._tokenize(doc.page_content)
+                self._doc_lengths.append(len(tokens))
+                unique_tokens = set(tokens)
+                for token in unique_tokens:
+                    self._doc_freqs[token] += 1
+
+            self._avgdl = (
+                sum(self._doc_lengths) / len(self._doc_lengths)
+                if self._doc_lengths
+                else 0.0
+            )
+
+            # Precompute IDF values
+            N = len(documents)
+            for token, df in self._doc_freqs.items():
+                self._idf_cache[token] = np.log((N - df + 0.5) / (df + 0.5) + 1.0)
+
+            self._indexed = True
+            logger.info(
+                "BM25 index built: %d docs, avg length %.1f, %d unique terms.",
+                N,
+                self._avgdl,
+                len(self._doc_freqs),
+            )
+
+    def search(self, query: str, k: int = 5) -> List[Document]:
+        """Search the BM25 index for the top-k matching documents.
+
+        Args:
+            query: The search query string.
+            k: Number of results to return.
+
+        Returns:
+            Top-k Documents sorted by BM25 score (descending).
+        """
+        if not self._indexed:
+            logger.warning("BM25 index not built — returning empty results.")
+            return []
+
+        query_tokens = self._tokenize(query)
+        scores: List[float] = []
+
+        for i, doc in enumerate(self._corpus):
+            doc_tokens = self._tokenize(doc.page_content)
+            doc_len = self._doc_lengths[i]
+            term_freqs: Dict[str, int] = {}
+            for t in doc_tokens:
+                term_freqs[t] = term_freqs.get(t, 0) + 1
+
+            score = 0.0
+            for token in set(query_tokens):
+                if token not in self._idf_cache:
+                    continue
+                tf = term_freqs.get(token, 0)
+                if tf == 0:
+                    continue
+                idf = self._idf_cache[token]
+                numerator = tf * (self.k1 + 1)
+                denominator = tf + self.k1 * (1 - self.b + self.b * doc_len / max(self._avgdl, 1))
+                score += idf * numerator / denominator
+
+            scores.append(score)
+
+        scored_pairs = sorted(
+            zip(scores, self._corpus), key=lambda x: x[0], reverse=True
+        )
+        results = []
+        for score, doc in scored_pairs[:k]:
+            if score > 0:
+                new_doc = Document(
+                    page_content=doc.page_content,
+                    metadata={**doc.metadata, "bm25_score": float(score)},
+                )
+                results.append(new_doc)
+
+        return results
+
+
+_bm25_retriever: Optional[BM25Retriever] = None
+_bm25_lock = Lock()
+
+
+def get_bm25_retriever() -> BM25Retriever:
+    """Return a shared singleton BM25Retriever instance."""
+    global _bm25_retriever
+    if _bm25_retriever is None:
+        with _bm25_lock:
+            if _bm25_retriever is None:
+                _bm25_retriever = BM25Retriever(
+                    k1=settings.bm25_k1,
+                    b=settings.bm25_b,
+                )
+    return _bm25_retriever
+
+
+def merge_hybrid_results(
+    dense_docs: List[Document],
+    bm25_docs: List[Document],
+    dense_weight: float = 0.7,
+    bm25_weight: float = 0.3,
+    top_k: int = 10,
+) -> List[Document]:
+    """Merge dense and BM25 results using weighted reciprocal rank fusion.
+
+    Args:
+        dense_docs: Documents from vector search (with similarity_score).
+        bm25_docs: Documents from BM25 search (with bm25_score).
+        dense_weight: Weight for dense scores.
+        bm25_weight: Weight for BM25 scores.
+        top_k: Maximum number of merged documents to return.
+
+    Returns:
+        Merged and re-ranked list of Documents.
+    """
+    k = 60.0  # RRF constant
+    score_map: Dict[str, tuple] = {}  # doc_id -> (accumulated_score, Document)
+
+    for rank, doc in enumerate(dense_docs):
+        doc_id = deterministic_hash(doc.page_content)
+        rrf_score = dense_weight / (k + rank + 1)
+        score_map[doc_id] = (rrf_score, doc)
+
+    for rank, doc in enumerate(bm25_docs):
+        doc_id = deterministic_hash(doc.page_content)
+        rrf_score = bm25_weight / (k + rank + 1)
+        if doc_id in score_map:
+            existing_score, _ = score_map[doc_id]
+            score_map[doc_id] = (existing_score + rrf_score, doc)
+        else:
+            score_map[doc_id] = (rrf_score, doc)
+
+    merged = sorted(score_map.values(), key=lambda x: x[0], reverse=True)
+    result = []
+    for score, doc in merged[:top_k]:
+        doc.metadata["hybrid_score"] = float(score)
+        doc.metadata["search_source"] = "hybrid"
+        result.append(doc)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Thread-safe LRU cache with TTL
 # ---------------------------------------------------------------------------
 
@@ -101,7 +400,6 @@ class _LRUCache:
             if time.time() - entry["timestamp"] >= self._ttl:
                 del self._store[key]
                 return None
-            # Move to end (most recently used)
             self._store.move_to_end(key)
             return entry["result"]
 
@@ -112,7 +410,7 @@ class _LRUCache:
                 self._store.move_to_end(key)
             self._store[key] = {"result": value, "timestamp": time.time()}
             while len(self._store) > self._maxsize:
-                self._store.popitem(last=False)  # evict least-recently-used
+                self._store.popitem(last=False)
 
     def clear(self) -> None:
         with self._lock:
@@ -137,7 +435,7 @@ def cache_llm_call(
 
     Args:
         func: The callable to invoke on cache miss.
-        params: Keyword arguments forwarded to *func*.
+        params: Keyword arguments forwarded to *func* via ``func(**params)``.
         cache_key: The cache lookup key.
         ttl: Override TTL in seconds (defaults to ``settings.cache_ttl_seconds``).
 
@@ -145,7 +443,7 @@ def cache_llm_call(
         The cached or freshly-computed result.
     """
     if not settings.enable_caching:
-        return func(**params)
+        return func(params)
 
     cached = _cache.get(cache_key)
     if cached is not None:
@@ -161,6 +459,49 @@ def cache_llm_call(
 def clear_cache() -> None:
     """Clear the entire LLM call cache. Useful for testing."""
     _cache.clear()
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter (NEW)
+# ---------------------------------------------------------------------------
+
+class RateLimiter:
+    """Simple sliding-window rate limiter for API protection."""
+
+    def __init__(self, max_requests: int = 30, window_seconds: int = 60):
+        self._max = max_requests
+        self._window = window_seconds
+        self._timestamps: List[float] = []
+        self._lock = Lock()
+
+    def acquire(self) -> bool:
+        """Try to acquire a request slot. Returns True if allowed."""
+        now = time.time()
+        with self._lock:
+            cutoff = now - self._window
+            self._timestamps = [t for t in self._timestamps if t > cutoff]
+            if len(self._timestamps) < self._max:
+                self._timestamps.append(now)
+                return True
+            return False
+
+    @property
+    def remaining(self) -> int:
+        with self._lock:
+            cutoff = time.time() - self._window
+            self._timestamps = [t for t in self._timestamps if t > cutoff]
+            return max(0, self._max - len(self._timestamps))
+
+
+_rate_limiter = RateLimiter(
+    max_requests=settings.rate_limit_requests,
+    window_seconds=settings.rate_limit_window_seconds,
+)
+
+
+def check_rate_limit() -> bool:
+    """Check if the current request is within rate limits. Returns True if allowed."""
+    return _rate_limiter.acquire()
 
 
 # ---------------------------------------------------------------------------
@@ -203,8 +544,7 @@ def retry_on_failure(
                     last_exc = e
                     if attempt < max_retries:
                         logger.warning(
-                            "Attempt %d/%d failed for %s: %s. "
-                            "Retrying in %.1fs...",
+                            "Attempt %d/%d failed for %s: %s. Retrying in %.1fs...",
                             attempt,
                             max_retries,
                             getattr(func, "__name__", repr(func)),

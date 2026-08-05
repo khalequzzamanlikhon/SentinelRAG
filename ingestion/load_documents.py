@@ -2,7 +2,8 @@
 Document ingestion pipeline for SentinelRAG.
 
 Parses PDF files from ``data/raw/``, chunks the text, generates embeddings
-via OpenAI, and stores vectors in a Qdrant collection.
+via local sentence-transformers, stores vectors in a Qdrant collection,
+and builds the BM25 sparse index for hybrid search.
 
 Two operating modes:
   - **embedded**  (default) — local on-disk Qdrant, zero infrastructure.
@@ -18,7 +19,7 @@ from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 
 from src.config import settings
-from src.utils import chunk_document, get_embeddings_client
+from src.utils import chunk_document, get_embeddings_client, get_bm25_retriever
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +144,17 @@ def ingest_data(data_dir: str = "data/raw", force_reingest: bool = False) -> Qdr
             settings.qdrant_collection_name,
         )
         logger.info("  To force re-ingestion, pass force_reingest=True.")
+        # Rebuild BM25 index (fast — parses PDFs, no re-embedding needed)
+        if settings.enable_hybrid_search:
+            try:
+                all_chunks = _parse_pdfs(data_dir)
+                bm25 = get_bm25_retriever()
+                if not bm25._indexed:
+                    logger.info("Rebuilding BM25 sparse index...")
+                    bm25.index(all_chunks)
+                    logger.info("BM25 index rebuilt (%d chunks).", len(all_chunks))
+            except Exception as e:
+                logger.warning("BM25 rebuild skipped: %s", e)
         return _build_vectorstore(embeddings)
 
     # ── Parse, chunk, embed, and store ─────────────────────────────
@@ -163,4 +175,15 @@ def ingest_data(data_dir: str = "data/raw", force_reingest: bool = False) -> Qdr
     )
 
     logger.info("Ingestion complete — %d vectors stored.", len(all_chunks))
+
+    # Build BM25 sparse index for hybrid search
+    if settings.enable_hybrid_search:
+        logger.info("Building BM25 sparse index for hybrid search...")
+        try:
+            bm25 = get_bm25_retriever()
+            bm25.index(all_chunks)
+            logger.info("BM25 index built successfully.")
+        except Exception as e:
+            logger.warning("BM25 index build failed (hybrid search will use dense only): %s", e)
+
     return vectorstore

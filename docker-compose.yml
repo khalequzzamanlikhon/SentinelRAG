@@ -1,32 +1,51 @@
-version: '3.8'
+version: "3.9"
 
 services:
+  # ── Qdrant Vector Database ──
   qdrant:
     image: qdrant/qdrant:latest
+    container_name: sentinelrag_qdrant
     ports:
       - "6333:6333"
+      - "6334:6334"
     volumes:
-      - ./data/qdrant_storage:/qdrant/storage
-    networks:
-      - sentinel-net
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
+  # ── SentinelRAG Streamlit App ──
   app:
     build:
       context: .
       dockerfile: docker/Dockerfile
+    container_name: sentinelrag_app
     ports:
       - "8501:8501"
     environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
       - QDRANT_MODE=server
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
-    env_file:
-      - .env
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - ENABLE_WEB_SEARCH=${ENABLE_WEB_SEARCH:-true}
+      - ENABLE_HYBRID_SEARCH=${ENABLE_HYBRID_SEARCH:-true}
+      - ENABLE_GUARDRAILS=${ENABLE_GUARDRAILS:-true}
+      - ENABLE_TRACING=${ENABLE_TRACING:-false}
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
+    volumes:
+      - ./data/raw:/app/data/raw:ro
     depends_on:
-      - qdrant
-    networks:
-      - sentinel-net
+      qdrant:
+        condition: service_healthy
+    restart: unless-stopped
 
-networks:
-  sentinel-net:
-    driver: bridge
+volumes:
+  qdrant_data:
+    driver: local
