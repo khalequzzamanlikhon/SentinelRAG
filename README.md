@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🛡️ SentinelRAG v2.1
+# SentinelRAG v2.1
 
 ### Self-Correcting Agentic RAG System with Hybrid Search
 
@@ -29,40 +29,40 @@
 
 ---
 
-## ✨ Features
+## Features
 
 **What's new in v2.1:**
-- 🔀 **Hybrid dense+sparse retrieval** — combines Qdrant vector search with BM25 for better keyword recall
-- 🎯 **Real cross-encoder reranking** — BGE-reranker-v2-m3 replaces slow LLM-based reranking
-- 🌐 **Web search fallback** — Tavily integration when local documents are insufficient
-- 🛡️ **Input guardrails** — prompt injection detection, length limits, homoglyph detection
-- ⚡ **Streaming generation** — token-by-token real-time display
-- 📊 **RAGAS evaluation** — faithfulness, context precision/recall, answer relevancy metrics
-- 📈 **Self-play evaluation** — auto-generate test questions from your documents
-- ⏱️ **Rate limiting** — sliding-window protection for API usage
-- 🔍 **LangFuse tracing** — optional observability for production deployments
+- **Hybrid dense+sparse retrieval** — combines Qdrant vector search with BM25 for better keyword recall
+- **Real cross-encoder reranking** — BGE-reranker-v2-m3 replaces slow LLM-based reranking
+- **Web search fallback** — Tavily integration when local documents are insufficient
+- **Input guardrails** — prompt injection detection, length limits, homoglyph detection
+- **Streaming generation** — token-by-token real-time display
+- **RAGAS evaluation** — faithfulness, context precision/recall, answer relevancy metrics
+- **Self-play evaluation** — auto-generate test questions from your documents
+- **Rate limiting** — sliding-window protection for API usage
+- **LangFuse tracing** — optional observability for production deployments
 
 ---
 
-## 🏗 Architecture
+## Architecture
 
 The core of SentinelRAG is a **stateful LangGraph workflow** where each node performs a discrete reasoning task and conditional edges route execution based on evaluation outcomes.
 
 ```mermaid
 graph TD
-    A["📥 User Query"] --> G["🛡️ Guardrails"]
-    G -->|"Passed"| B["🔎 Hybrid Retrieve<br/>(Dense + BM25)"]
-    G -->|"Blocked"| X["❌ Reject"]
-    B --> C["📋 Grade Documents"]
-    C -->|"Relevant docs found"| D["🎯 Cross-Encoder Rerank"]
-    C -->|"All irrelevant"| E["🌐 Web Search (Tavily)"]
-    C -->|"All irrelevant + no web"| F["🔄 Rewrite Query"]
+    A["User Query"] --> G["Guardrails"]
+    G -->|"Passed"| B["Hybrid Retrieve<br/>(Dense + BM25)"]
+    G -->|"Blocked"| X["Reject"]
+    B --> C["Grade Documents"]
+    C -->|"Relevant docs found"| D["Cross-Encoder Rerank"]
+    C -->|"All irrelevant"| E["Web Search (Tavily)"]
+    C -->|"All irrelevant + no web"| F["Rewrite Query"]
     E --> C
     F --> B
-    D --> H["⚡ Generate (Streaming)"]
-    H --> I["🛡️ Hallucination Check"]
-    I --> J["📚 Extract Citations"]
-    J --> K["✅ Finalize Response"]
+    D --> H["Generate (Streaming)"]
+    H --> I["Hallucination Check"]
+    I --> J["Extract Citations"]
+    J --> K["Finalize Response"]
 
     style A fill:#6366f1,stroke:#4f46e5,color:#fff
     style B fill:#3b82f6,stroke:#2563eb,color:#fff
@@ -91,7 +91,7 @@ graph TD
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 
@@ -167,7 +167,7 @@ streamlit run ui/streamlit_app.py
 
 Open `http://localhost:8501` and start asking questions!
 
-### 🐳 Docker
+### Docker
 
 ```bash
 docker-compose up --build
@@ -179,7 +179,7 @@ This starts:
 
 ---
 
-## 🔬 How It Works
+## How It Works
 
 ### Stage 1 — Guardrails (NEW)
 User input is validated against blocked patterns (prompt injection attempts), length limits, and Unicode homoglyph detection before entering the pipeline.
@@ -214,7 +214,7 @@ Structured source citations with confidence scores are extracted. The complete a
 
 ---
 
-## 🛠 Tech Stack
+## Tech Stack
 
 | Layer | Technology | Purpose |
 |---|---|---|
@@ -235,7 +235,7 @@ Structured source citations with confidence scores are extracted. The complete a
 
 ---
 
-## 📈 Evaluation
+## Evaluation
 
 Run the RAGAS evaluation suite to benchmark your pipeline:
 
@@ -264,7 +264,7 @@ questions = generate_self_play_questions(documents, num_questions=20)
 
 ---
 
-## ⚙️ Configuration
+## Configuration
 
 All parameters managed via `src/config.py`, overridable via environment variables:
 
@@ -287,7 +287,7 @@ All parameters managed via `src/config.py`, overridable via environment variable
 
 ---
 
-## 🧪 Running Tests
+## Running Tests
 
 ```bash
 pytest
@@ -295,7 +295,7 @@ pytest
 
 ---
 
-## 📜 License
+## License
 
 MIT License — see [LICENSE](LICENSE).
 
